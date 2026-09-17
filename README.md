@@ -1,13 +1,13 @@
 # bombi
 
-One AI development setup. Any assistant.
+**One AI development setup. Any assistant.**
 
 Your team uses Claude Code, Gemini CLI, Copilot, Cursor, Codex, or plain ChatGPT.
 `bombi` makes them all follow the same architecture rules, with the same workflow,
 enforced by the same build — without anyone configuring anything.
 
 ```bash
-curl -fsSL <your-url>/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Mahlomola-Moses/bombi/main/install.sh | bash
 
 cd your-repo
 bombi init          # tech lead, once
@@ -15,26 +15,42 @@ bombi setup         # every dev, after cloning
 bombi check         # before every PR
 ```
 
-## What it sets up
+---
+
+## Why
+
+Written rules get ignored — by tired humans and by AI agents halfway through a long
+session. Config files only bind the people using that tool. So bombi puts the rules
+in the repo where every agent reads them, and puts the *enforcement* in lint and CI
+where it binds everyone equally.
+
+**The repo is the source of truth. The tool is disposable.**
+
+---
+
+## What `bombi init` creates
 
 | File | Read by |
 |---|---|
-| `AGENTS.md` | Codex, Copilot, Cursor, Gemini CLI, Jules, Aider, Zed, Windsurf (~30 agents) |
-| `CLAUDE.md` | Claude Code — one line, `@AGENTS.md` |
+| `AGENTS.md` | Codex, Copilot, Cursor, Gemini CLI, Aider, Zed, Windsurf — ~30 agents |
+| `CLAUDE.md` | Claude Code. One line: `@AGENTS.md` |
 | `.gemini/settings.json` | Gemini CLI — `context.fileName` points at AGENTS.md |
 | `.specify/memory/constitution.md` | Spec Kit — checked at plan and analyze time |
 | `.dependency-cruiser.cjs` | **the build** — the only rule that binds every tool equally |
-| `scripts/verify.sh`, `.githooks/`, CI | the gates |
+| `scripts/verify.sh` | the gate: typecheck + boundaries + lint + tests |
+| `.githooks/pre-commit` | blocks new violations before CI sees them |
+| `.github/workflows/verify.yml` | CI |
 | `AI-QUICKSTART.md` | your devs, in two minutes |
 
-Spec Kit slash commands are installed for each agent, so the feature workflow
-(`specify → clarify → plan → tasks → analyze → implement`) is identical no matter
-what anyone is running.
+If `specify` is installed, Spec Kit slash commands are set up for each agent too, so
+the feature workflow is identical no matter what anyone is running.
+
+---
 
 ## Existing codebases: the ratchet
 
 `bombi init` detects a legacy repo and **records** the architecture violations that
-already exist instead of demanding you fix them. CI goes green on day one, and only
+already exist instead of demanding you fix them. CI goes green on day one; only
 *new* violations fail the build.
 
 ```bash
@@ -42,8 +58,15 @@ bombi debt        # what's recorded, grouped by rule
 bombi baseline    # re-record after fixing some — REFUSES to grow
 ```
 
-That refusal is the point. A dev can't launder a new violation into the baseline;
-the number only goes down.
+That refusal is the point. Nobody can launder a fresh violation into the forgiven
+list. The number only goes down.
+
+```
+✗ Baseline would GROW: 5 → 6
+  New violations must be fixed, not recorded.
+```
+
+---
 
 ## Commands
 
@@ -57,25 +80,48 @@ bombi context [topic]   dump rules + code to paste into ChatGPT
 bombi doctor            what's installed, what's missing
 ```
 
-## The design principle
+`agent` is one of: `claude` `gemini` `copilot` `cursor` `codex` `none`
 
-The repo is the source of truth; the tool is disposable. Rules live in plain
-markdown any agent reads and any human can paste. Enforcement lives in lint and CI,
-because a written rule binds only the sessions that read it carefully — a failing
-build binds everyone.
+---
+
+## The feature workflow
+
+```
+/speckit.specify    the requirement, in business language — what, not how
+/speckit.clarify    answer its questions. Do not skip this one.
+/speckit.plan       technical plan, checked against your constitution
+/speckit.tasks      dependency-ordered task list
+/speckit.analyze    must come back clean
+/speckit.implement
+```
+
+Claude Code in skills mode uses hyphens (`/speckit-specify`); Gemini CLI uses dots.
+
+**Required** for migrations, new endpoints, API contract changes, or anything
+touching more than three files. **Not required** for bug fixes, copy, styling, or
+dependency bumps.
+
+---
 
 ## Requirements
 
-Node 18+, git. Spec Kit (optional but recommended) needs `uv`:
+Node 18+ and git. Spec Kit is optional but recommended:
 
 ```bash
 uv tool install specify-cli --from git+https://github.com/github/spec-kit.git
 ```
 
+---
+
 ## Notes
 
-- `bombi init` never overwrites an existing file; it reports and moves on.
-- Review the generated `AGENTS.md`. It's assembled from guesses about your repo.
-  Wrong rules are worse than no rules.
-- Claude Code in skills mode uses `/speckit-specify` (hyphens); Gemini CLI uses
-  `/speckit.specify` (dots).
+- `bombi init` never overwrites an existing file. It reports and moves on, so it's
+  safe to re-run.
+- **Review the generated `AGENTS.md`.** It's assembled from guesses about your repo.
+  A wrong rule is worse than no rule.
+- Boundary rules are generated from your actual directory names — if your data layer
+  is `src/models/`, that's what the rules say.
+
+## License
+
+MIT
