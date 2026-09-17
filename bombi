@@ -1,0 +1,632 @@
+#!/usr/bin/env bash
+# bombi — one command to put a repo (new or old) under the shared AI dev setup.
+#
+#   bombi init      set up this repo        (tech lead, once)
+#   bombi setup     set up my machine       (every dev, after cloning)
+#   bombi check     is this repo compliant? (you, CI, or your agent)
+#   bombi baseline  re-record known violations after fixing some
+#   bombi doctor    what's installed, what's missing
+#
+# Detects greenfield vs legacy and does the right thing either way.
+
+set -euo pipefail
+BOMBI_VERSION="1.0.0"
+
+# ANSI-C quoting so the escapes are real characters, usable inside %s too
+B=$'\033[0;34m'; G=$'\033[0;32m'; Y=$'\033[0;33m'; R=$'\033[0;31m'; D=$'\033[0;90m'; N=$'\033[0m'
+[ -t 1 ] || { B=''; G=''; Y=''; R=''; D=''; N=''; }   # no colour when piped
+info() { printf "${B}→${N} %s\n" "$1"; }
+ok()   { printf "${G}✓${N} %s\n" "$1"; }
+warn() { printf "${Y}!${N} %s\n" "$1"; }
+err()  { printf "${R}✗${N} %s\n" "$1"; }
+dim()  { printf "${D}  %s${N}\n" "$1"; }
+skip() { printf "${Y}·${N} %s ${D}(exists, left alone)${N}\n" "$1"; }
+
+die() { err "$1"; exit 1; }
+need_repo() { [ -d .git ] || die "Not a git repository. Run bombi from your repo root."; }
+
+# write <path> — content on stdin; never overwrites
+write() {
+  local p="$1"
+  if [ -e "$p" ]; then skip "$p"; cat >/dev/null; return 0; fi
+  mkdir -p "$(dirname "$p")"; cat > "$p"; ok "$p"
+}
+
+has_script() { node -e "process.exit(require('./package.json').scripts?.['$1']?0:1)" 2>/dev/null; }
+has_dep() { node -e "const p=require('./package.json');process.exit(((p.dependencies||{})['$1']||(p.devDependencies||{})['$1'])?0:1)" 2>/dev/null; }
+
+# ═══════════════════════════════════════════════════════════════
+# survey — populates globals used by init
+# ═══════════════════════════════════════════════════════════════
+survey() {
+  PKG_MGR=npm
+  [ -f yarn.lock ] && PKG_MGR=yarn
+  [ -f pnpm-lock.yaml ] && PKG_MGR=pnpm
+
+  HAS_TS=no;   [ -f tsconfig.json ] && HAS_TS=yes
+  HAS_TC=no;   has_script typecheck && HAS_TC=yes
+  HAS_LINT=no; has_script lint && HAS_LINT=yes
+  HAS_TEST=no; has_script test && HAS_TEST=yes
+
+  STACK=""
+  for d in express fastify koa @nestjs/core next react vue svelte knex prisma typeorm sequelize ioredis redis mysql2 pg; do
+    has_dep "$d" && STACK="$STACK ${d#@nestjs/core}"
+  done
+  STACK="$(echo "$STACK" | sed 's/^ *//')"
+
+  SRC_DIR=src
+  [ -d src ] || SRC_DIR="$(ls -d app lib server 2>/dev/null | head -1 || echo .)"
+  SRC_DIR="${SRC_DIR%/}"
+
+  LAYERS="$(ls -d "$SRC_DIR"/*/ 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ' || true)"
+  FILE_COUNT="$(git ls-files "$SRC_DIR" 2>/dev/null | wc -l | tr -d ' ')"
+  COMMITS="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
+
+  # the data-access directory, whatever this repo calls it
+  DATA_DIR=repositories
+  for c in repositories repository models dal data dao stores; do
+    [ -d "$SRC_DIR/$c" ] && DATA_DIR="$c" && break
+  done
+
+  # greenfield vs legacy: commits, size, or age — any one is enough
+  AGE_DAYS=0
+  local first; first=$(git log --reverse --format=%ct 2>/dev/null | head -1 || echo "")
+  [ -n "$first" ] && AGE_DAYS=$(( ( $(date +%s) - first ) / 86400 ))
+  MODE=greenfield
+  if [ "$COMMITS" -gt 5 ] || [ "$FILE_COUNT" -gt 15 ] || [ "$AGE_DAYS" -gt 60 ]; then MODE=legacy; fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# bombi init
+# ═══════════════════════════════════════════════════════════════
+cmd_init() {
+  need_repo
+  [ -f package.json ] || die "No package.json here. bombi currently supports Node projects."
+  command -v node >/dev/null || die "Node.js is required."
+
+  echo; info "Surveying the repository…"
+  survey
+
+  ok "mode: $MODE  ${D}($COMMITS commits, $FILE_COUNT source files, ${AGE_DAYS}d old)${N}"
+  ok "package manager: $PKG_MGR   typescript: $HAS_TS"
+  ok "gates present — typecheck: $HAS_TC  lint: $HAS_LINT  test: $HAS_TEST"
+  ok "source: $SRC_DIR/  data layer: $SRC_DIR/$DATA_DIR/"
+  ok "stack: ${STACK:-none detected}"
+  echo
+
+  gen_agents_md
+  gen_pointers
+  gen_verify
+  gen_depcruise
+  install_depcruise
+  gen_baseline
+  gen_hooks
+  gen_quickstart
+  gen_ci
+  wire_package_json
+  wire_gitignore
+  maybe_speckit
+
+  echo
+  printf "${G}Repo initialised.${N} Next:\n\n"
+  printf "  1. ${Y}Read AGENTS.md and fix it.${N} It was generated from guesses about your\n"
+  printf "     repo. Wrong rules are worse than none.\n\n"
+  printf "  2. Write your architecture principles:\n"
+  printf "       open your agent, run /speckit.constitution (or /speckit-constitution)\n\n"
+  printf "  3. Prove it's green before anyone else sees it:\n"
+  printf "       bombi check\n\n"
+  printf "  4. git add -A && git commit -m \"chore: bombi — shared AI dev setup\"\n\n"
+  printf "  Devs then run one command: ${B}bombi setup${N}\n\n"
+}
+
+gen_agents_md() {
+  {
+    echo "# AGENTS.md"
+    echo
+    echo "<!-- Canonical instructions for ALL AI coding agents. Generated by bombi"
+    echo "     from this repo as it actually is. REVIEW EVERY LINE. -->"
+    echo
+    echo "<One sentence: what this product does and who uses it.>"
+    echo
+    echo "## Stack"
+    echo "${STACK:-(fill in manually)}"
+    echo "Package manager: \`$PKG_MGR\`"
+    echo
+    echo "## Commands"
+    echo '```bash'
+    echo "bombi check      # typecheck + boundaries + lint + tests. Nothing is done until this passes."
+    [ "$HAS_TC" = yes ]   && echo "$PKG_MGR run typecheck" || echo "# typecheck: NOT SET UP"
+    [ "$HAS_LINT" = yes ] && echo "$PKG_MGR run lint"      || echo "# lint: NOT SET UP"
+    [ "$HAS_TEST" = yes ] && echo "$PKG_MGR test"          || echo "# tests: NOT SET UP"
+    echo '```'
+    echo
+    echo "## Code layout"
+    echo "Source in \`$SRC_DIR/\`. Data access in \`$SRC_DIR/$DATA_DIR/\`."
+    echo "Subdirectories:${LAYERS:+ $LAYERS}"
+    if [ "$MODE" = legacy ]; then
+      echo
+      echo "## This is an existing codebase — read before changing anything"
+      echo "- Not all existing code follows the rules below. Known exceptions are in"
+      echo "  \`.dependency-cruiser-known-violations.json\`."
+      echo "- **Do not bulk-refactor them.** Leave old code alone unless the task is"
+      echo "  explicitly a refactor."
+      echo "- New and modified code MUST follow the rules. The baseline forgives only"
+      echo "  what was already there, and it should only ever shrink."
+      echo "- Before adding anything, search for an existing implementation and extend"
+      echo "  it. Building a second version of something that exists is the most common"
+      echo "  failure mode here."
+      echo "- Match the style of the file you are editing, even where you dislike it."
+    fi
+    echo
+    echo "## Architecture principles"
+    echo "Governed by \`.specify/memory/constitution.md\`. Read it before planning any"
+    echo "change. Boundaries are enforced mechanically by \`.dependency-cruiser.cjs\`."
+    echo
+    echo "## Working rules"
+    echo "- Ambiguous requirement → ask. Do not guess and build."
+    echo "- Never commit, push, run non-local migrations, edit \`.env\`, or add a"
+    echo "  dependency without asking."
+    echo "- Never make a failing test pass by changing the assertion."
+    echo "- New logic ships with tests, including unhappy paths."
+    echo
+    echo "## Feature workflow"
+    echo "Non-trivial work goes through Spec Kit: specify → clarify → plan → tasks →"
+    echo "analyze → implement. See AI-QUICKSTART.md for when it is required."
+  } > /tmp/_bombi_agents.md
+  write AGENTS.md < /tmp/_bombi_agents.md
+}
+
+gen_pointers() {
+  write CLAUDE.md <<'EOF'
+@AGENTS.md
+
+<!-- Claude Code extras only. Everything shared lives in AGENTS.md. -->
+Use plan mode for anything touching more than two files.
+EOF
+
+  write .gemini/settings.json <<'EOF'
+{
+  "context": {
+    "fileName": ["AGENTS.md", "GEMINI.md"]
+  }
+}
+EOF
+
+  write .github/copilot-instructions.md <<'EOF'
+Follow `AGENTS.md` at the repository root and the principles in
+`.specify/memory/constitution.md`. Search for an existing implementation before
+writing a new one. Do not deviate from the layering rules.
+EOF
+
+  write .cursor/rules/project.mdc <<'EOF'
+---
+description: Project conventions
+alwaysApply: true
+---
+Follow @AGENTS.md and @.specify/memory/constitution.md.
+EOF
+}
+
+gen_verify() {
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# Generated by bombi. The single definition of "done".'
+    echo '# Gates are added as the codebase earns them — uncomment the TODOs.'
+    echo 'set -euo pipefail'
+    if [ "$HAS_TC" = yes ]; then echo "echo '→ typecheck'; $PKG_MGR run typecheck --silent"
+    else echo "# TODO enable: $PKG_MGR run typecheck"; fi
+    echo "echo '→ boundaries'; npx depcruise \"$SRC_DIR\" --config .dependency-cruiser.cjs --ignore-known"
+    if [ "$HAS_LINT" = yes ]; then echo "echo '→ lint'; $PKG_MGR run lint --silent"
+    else echo "# TODO enable: $PKG_MGR run lint"; fi
+    if [ "$HAS_TEST" = yes ]; then echo "echo '→ tests'; $PKG_MGR test --silent"
+    else echo "# TODO enable: $PKG_MGR test"; fi
+    echo 'echo "✓ all checks passed"'
+  } > /tmp/_bombi_verify.sh
+  write scripts/verify.sh < /tmp/_bombi_verify.sh
+  chmod +x scripts/verify.sh 2>/dev/null || true
+}
+
+gen_depcruise() {
+  {
+    echo "/** Architecture boundaries, generated by bombi."
+    echo " *  Pre-existing violations live in .dependency-cruiser-known-violations.json"
+    echo " *  and are ignored via --ignore-known, so this blocks only NEW ones. */"
+    echo "module.exports = {"
+    echo "  forbidden: ["
+    echo "    {"
+    echo "      name: 'no-data-access-outside-$DATA_DIR',"
+    echo "      severity: 'error',"
+    echo "      comment: 'Only the data layer may import the database client.',"
+    echo "      from: { pathNot: '^$SRC_DIR/$DATA_DIR' },"
+    echo "      to:   { path: '^$SRC_DIR/$DATA_DIR/(db|database|knex|connection|client)' },"
+    echo "    },"
+    echo "    {"
+    echo "      name: 'no-$DATA_DIR-from-controller',"
+    echo "      severity: 'error',"
+    echo "      comment: 'Controllers talk to services, never straight to the data layer.',"
+    echo "      from: { path: '^$SRC_DIR/controllers' },"
+    echo "      to:   { path: '^$SRC_DIR/$DATA_DIR' },"
+    echo "    },"
+    echo "    {"
+    echo "      name: 'no-controller-from-service',"
+    echo "      severity: 'error',"
+    echo "      comment: 'Services must not know HTTP exists.',"
+    echo "      from: { path: '^$SRC_DIR/services' },"
+    echo "      to:   { path: '^$SRC_DIR/controllers' },"
+    echo "    },"
+    echo "    { name: 'no-circular', severity: 'error', from: {}, to: { circular: true } },"
+    echo "  ],"
+    echo "  options: {"
+    echo "    doNotFollow: { path: 'node_modules' },"
+    [ "$HAS_TS" = yes ] && echo "    tsConfig: { fileName: 'tsconfig.json' },"
+    echo "  },"
+    echo "};"
+  } > /tmp/_bombi_dc.cjs
+  write .dependency-cruiser.cjs < /tmp/_bombi_dc.cjs
+}
+
+install_depcruise() {
+  if [ -d node_modules/dependency-cruiser ]; then ok "dependency-cruiser present"; return; fi
+  info "installing dependency-cruiser…"
+  npm install --silent --no-audit --no-fund --save-dev dependency-cruiser >/dev/null 2>&1 \
+    && ok "dependency-cruiser installed" || warn "install failed — run: npm i -D dependency-cruiser"
+}
+
+gen_baseline() {
+  [ -f .dependency-cruiser-known-violations.json ] && { skip ".dependency-cruiser-known-violations.json"; return; }
+  info "recording existing violations…"
+  if npx depcruise "$SRC_DIR" --config .dependency-cruiser.cjs --output-type baseline \
+       > .dependency-cruiser-known-violations.json 2>/dev/null; then
+    local n; n=$(node -e "try{console.log(require('./.dependency-cruiser-known-violations.json').length)}catch(e){console.log(0)}")
+    if [ "$n" -gt 0 ]; then
+      warn "$n existing violations recorded — the build is green, but they are now visible"
+      dim "this file is your architecture debt list. It should only ever shrink."
+    else
+      ok "no existing violations — better shape than most"
+    fi
+  else
+    rm -f .dependency-cruiser-known-violations.json
+    warn "could not record a baseline — run 'bombi baseline' after fixing the config"
+  fi
+}
+
+gen_hooks() {
+  write .githooks/pre-commit <<'EOF'
+#!/usr/bin/env bash
+# Installed by 'bombi setup' via core.hooksPath. Fast gate only — full run is 'bombi check'.
+set -euo pipefail
+SRC=$(node -e "const fs=require('fs');for(const d of ['src','app','lib','server'])if(fs.existsSync(d)){console.log(d);process.exit(0)}console.log('.')")
+npx depcruise "$SRC" --config .dependency-cruiser.cjs --ignore-known || {
+  echo; echo "✗ New architecture violation. Fix it, or commit with --no-verify if you must."; exit 1; }
+EOF
+  chmod +x .githooks/pre-commit 2>/dev/null || true
+}
+
+gen_quickstart() {
+  {
+    cat <<'HEAD'
+# AI development — quickstart
+
+**Setup, once:** `bombi setup`
+
+Use whichever AI assistant you like — Claude Code, Gemini CLI, Copilot, Cursor,
+Codex, or plain ChatGPT. The rules live in this repo, so every tool follows the
+same ones. You configure nothing; it is already committed.
+
+## The rules
+- `AGENTS.md` — stack, commands, conventions. Read automatically by every major agent.
+- `.specify/memory/constitution.md` — architecture principles. Non-negotiable.
+- `.dependency-cruiser.cjs` — the same rules, mechanically enforced.
+
+HEAD
+    if [ "$MODE" = legacy ]; then
+      cat <<'LEGACY'
+## This codebase predates the rules
+
+`.dependency-cruiser-known-violations.json` records the violations that already
+existed when we adopted this. They are forgiven so the build could go green on
+day one.
+
+- **New and changed code must follow the rules.** New violations fail the build.
+- **Don't bulk-refactor the old ones.** Fix one only when you're already in that
+  file for another reason, then run `bombi baseline` to re-record.
+- The baseline should only ever shrink. If a PR grows it, that's a review comment.
+
+## Before you write anything
+
+Ask your agent to find the existing implementation first. On a codebase this age,
+the most common AI failure is confidently building a second version of something
+that already exists.
+
+LEGACY
+    fi
+    cat <<'TAIL'
+## Building a feature
+
+```
+/speckit.specify   <the requirement, in business language — what, not how>
+/speckit.clarify   ← answer its questions. Do not skip this one.
+/speckit.plan
+/speckit.tasks
+/speckit.analyze   ← must come back clean
+/speckit.implement
+```
+
+Claude Code in skills mode uses hyphens (`/speckit-specify`). Gemini CLI uses dots
+(`/speckit.specify`). Commit the whole `specs/NNN-feature/` directory — the spec is
+what gets reviewed; the diff is the consequence.
+
+**Required** for migrations, new endpoints, API contract changes, or anything
+touching more than three files.
+**Not required** for bug fixes, copy, styling, dependency bumps, or refactors with
+no behaviour change. Branch, fix, PR.
+
+## Before you open a PR
+
+```bash
+bombi check
+```
+
+Typecheck, boundaries, lint, tests. CI runs the same thing, so there's no point
+pushing past it.
+
+## On ChatGPT or Gemini web?
+
+No repo access, so paste the rules in:
+
+```bash
+bombi context orders | pbcopy      # macOS
+bombi context orders | xclip -sel clip
+```
+
+You won't get the pipeline, but you'll get the same rules.
+
+## The one rule that isn't negotiable
+
+You are the author of every line you submit, whichever tool wrote it. If you can't
+explain a line in review, it doesn't ship.
+TAIL
+  } > /tmp/_bombi_qs.md
+  write AI-QUICKSTART.md < /tmp/_bombi_qs.md
+
+  {
+    echo "## What & why"; echo; echo
+    echo "## Linked spec"
+    echo "\`specs/<NNN-feature-name>/spec.md\`  (or: n/a — small change)"; echo
+    echo "## Checklist"
+    echo "- [ ] \`bombi check\` passes"
+    [ "$MODE" = legacy ] && echo "- [ ] The known-violations baseline did not grow"
+    [ "$MODE" = legacy ] && echo "- [ ] I searched for an existing implementation before adding a new one"
+    echo "- [ ] Every acceptance criterion has a corresponding test"
+    echo "- [ ] I have read every line of this diff and can defend it"
+  } > /tmp/_bombi_pr.md
+  write .github/pull_request_template.md < /tmp/_bombi_pr.md
+}
+
+gen_ci() {
+  write .github/workflows/verify.yml <<'EOF'
+name: verify
+on: [push, pull_request]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm' }
+      - run: npm ci
+      - run: ./scripts/verify.sh
+EOF
+}
+
+wire_package_json() {
+  node -e '
+    const fs=require("fs"); const p=JSON.parse(fs.readFileSync("package.json","utf8"));
+    p.scripts=p.scripts||{};
+    const want={ verify:"./scripts/verify.sh" };
+    let a=[]; for(const[k,v] of Object.entries(want)) if(!p.scripts[k]){p.scripts[k]=v;a.push(k);}
+    if(a.length){ fs.writeFileSync("package.json", JSON.stringify(p,null,2)+"\n"); }
+  ' && ok "package.json"
+}
+
+wire_gitignore() {
+  [ -f .gitignore ] || touch .gitignore
+  grep -q '!.gemini/settings.json' .gitignore && return
+  printf '\n# bombi: keep shared AI config committed\n.gemini/*\n!.gemini/settings.json\n!.gemini/commands/\n' >> .gitignore
+  ok ".gitignore"
+}
+
+maybe_speckit() {
+  if [ -d .specify ]; then ok "spec kit already initialised"; return; fi
+  if command -v specify >/dev/null 2>&1; then
+    info "initialising spec kit…"
+    specify init --here --force --non-interactive --integration claude --ignore-agent-tools >/dev/null 2>&1 \
+      && ok "spec kit: claude" || warn "spec kit claude init failed"
+    specify init --here --force --non-interactive --integration gemini --ignore-agent-tools >/dev/null 2>&1 \
+      && ok "spec kit: gemini" || true
+  else
+    warn "spec kit not installed — install it, then rerun 'bombi init':"
+    dim "uv tool install specify-cli --from git+https://github.com/github/spec-kit.git"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# bombi setup — per developer
+# ═══════════════════════════════════════════════════════════════
+cmd_setup() {
+  need_repo
+  local agent="${1:-}"
+  printf "\n  bombi setup\n  ───────────\n\n"
+
+  command -v node >/dev/null || die "Node.js not found. Install Node 18+."
+  ok "node $(node -v)"
+
+  if [ -f package.json ]; then
+    if [ -f package-lock.json ]; then info "npm ci"; npm ci --silent
+    else info "npm install"; npm install --silent; fi
+    ok "dependencies"
+  fi
+
+  if [ -d .githooks ]; then
+    git config core.hooksPath .githooks
+    chmod +x .githooks/* 2>/dev/null || true
+    ok "git hooks"
+  fi
+
+  if [ -z "$agent" ]; then
+    printf "\n  Which AI assistant do you use?\n\n"
+    printf "    1) Claude Code     2) Gemini CLI     3) GitHub Copilot\n"
+    printf "    4) Cursor          5) Codex CLI      6) None / chat only\n\n"
+    printf "  Choice [1-6]: "
+    read -r c || c=6
+    case "$c" in 1) agent=claude;; 2) agent=gemini;; 3) agent=copilot;;
+                 4) agent=cursor;; 5) agent=codex;;  *) agent=none;; esac
+  fi
+  ok "agent: $agent"
+
+  case "$agent" in
+    claude) command -v claude >/dev/null && ok "claude code installed" \
+              || { warn "not installed:"; dim "npm i -g @anthropic-ai/claude-code"; } ;;
+    gemini) command -v gemini >/dev/null && ok "gemini cli installed" \
+              || { warn "not installed:"; dim "npm i -g @google/gemini-cli"; } ;;
+    codex)  command -v codex >/dev/null && ok "codex cli installed" \
+              || { warn "not installed:"; dim "npm i -g @openai/codex"; } ;;
+    copilot) dim "install the GitHub Copilot extension in your editor" ;;
+    cursor)  dim "download Cursor from https://cursor.com" ;;
+  esac
+
+  [ -d .specify ] && ok "spec kit commands available" || warn "spec kit not set up in this repo"
+
+  printf "\n${G}  Ready.${N}\n\n"
+  dim "Read    AI-QUICKSTART.md   (2 minutes — please actually read it)"
+  dim "Check   bombi check"
+  dim "Build   open your agent, run /speckit.specify \"<requirement>\""
+  echo
+}
+
+# ═══════════════════════════════════════════════════════════════
+# bombi check
+# ═══════════════════════════════════════════════════════════════
+cmd_check() {
+  need_repo
+  [ -x scripts/verify.sh ] || die "No scripts/verify.sh. Run 'bombi init' first."
+  echo
+  if ./scripts/verify.sh; then
+    if [ -f .dependency-cruiser-known-violations.json ]; then
+      local n; n=$(node -e "try{console.log(require('./.dependency-cruiser-known-violations.json').length)}catch(e){console.log(0)}" 2>/dev/null || echo 0)
+      [ "$n" -gt 0 ] && { echo; dim "$n known violations still baselined — 'bombi debt' to list them"; }
+    fi
+    echo; printf "${G}  All checks passed.${N}\n\n"
+  else
+    echo; err "Checks failed. Nothing is done until this passes."; echo; exit 1
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# bombi baseline / debt
+# ═══════════════════════════════════════════════════════════════
+cmd_baseline() {
+  need_repo
+  [ -f .dependency-cruiser.cjs ] || die "No .dependency-cruiser.cjs. Run 'bombi init' first."
+  survey
+  local before=0
+  [ -f .dependency-cruiser-known-violations.json ] && \
+    before=$(node -e "try{console.log(require('./.dependency-cruiser-known-violations.json').length)}catch(e){console.log(0)}")
+  npx depcruise "$SRC_DIR" --config .dependency-cruiser.cjs --output-type baseline \
+    > /tmp/_bombi_baseline.json 2>/dev/null || die "depcruise failed — check .dependency-cruiser.cjs"
+  local after; after=$(node -e "console.log(require('/tmp/_bombi_baseline.json').length)")
+  if [ "$after" -gt "$before" ]; then
+    err "Baseline would GROW: $before → $after"
+    dim "New violations must be fixed, not recorded. Run 'bombi check' to see them."
+    exit 1
+  fi
+  mv /tmp/_bombi_baseline.json .dependency-cruiser-known-violations.json
+  ok "baseline: $before → $after$([ "$after" -lt "$before" ] && echo "  (debt paid down, nice)")"
+}
+
+cmd_debt() {
+  need_repo
+  [ -f .dependency-cruiser-known-violations.json ] || { ok "no recorded violations"; return; }
+  node -e '
+    const v=require("./.dependency-cruiser-known-violations.json");
+    if(!v.length){ console.log("  no recorded violations"); process.exit(0); }
+    const by={}; for(const x of v){(by[x.rule.name]=by[x.rule.name]||[]).push(x);}
+    console.log("\n  Architecture debt — "+v.length+" recorded violations\n");
+    for(const [rule,items] of Object.entries(by)){
+      console.log("  "+rule+"  ("+items.length+")");
+      for(const i of items) console.log("    "+i.from+"  →  "+i.to);
+      console.log("");
+    }
+    console.log("  Fix these opportunistically, then run: bombi baseline\n");
+  '
+}
+
+# ═══════════════════════════════════════════════════════════════
+# bombi context — for chat-only devs
+# ═══════════════════════════════════════════════════════════════
+cmd_context() {
+  need_repo
+  local topic="${1:-}"
+  echo "===== AGENTS.md ====="; cat AGENTS.md 2>/dev/null
+  [ -f .specify/memory/constitution.md ] && { echo; echo "===== CONSTITUTION ====="; cat .specify/memory/constitution.md; }
+  if [ -n "$topic" ]; then
+    echo; echo "===== FILES MATCHING '$topic' ====="
+    git ls-files | grep -i "$topic" | head -40
+    echo; echo "===== SOURCE ====="
+    git ls-files | grep -i "$topic" | grep -E '\.(ts|tsx|js|jsx)$' | head -12 |
+      while read -r f; do echo "--- $f ---"; cat "$f"; done
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# bombi doctor
+# ═══════════════════════════════════════════════════════════════
+cmd_doctor() {
+  printf "\n  bombi doctor\n  ────────────\n\n"
+  check() { if command -v "$1" >/dev/null 2>&1; then ok "$1  ${D}$(${2:-echo} 2>/dev/null | head -1)${N}"; else warn "$1 — not installed"; fi; }
+  check node "node -v"
+  check git "git --version"
+  check specify "specify --version"
+  echo
+  for a in claude gemini codex cursor; do
+    command -v "$a" >/dev/null 2>&1 && ok "agent: $a" || dim "agent: $a (not installed)"
+  done
+  echo
+  if [ -d .git ]; then
+    for f in AGENTS.md CLAUDE.md .dependency-cruiser.cjs scripts/verify.sh .specify/memory/constitution.md; do
+      [ -e "$f" ] && ok "$f" || warn "$f missing — run 'bombi init'"
+    done
+    [ -f .dependency-cruiser-known-violations.json ] && \
+      dim "baselined violations: $(node -e "try{console.log(require('./.dependency-cruiser-known-violations.json').length)}catch(e){console.log(0)}")"
+    [ "$(git config core.hooksPath 2>/dev/null)" = ".githooks" ] && ok "git hooks active" || warn "git hooks inactive — run 'bombi setup'"
+  else
+    dim "not in a git repository"
+  fi
+  echo
+}
+
+# ═══════════════════════════════════════════════════════════════
+usage() {
+  printf "\n  bombi %s — one AI dev setup, any assistant\n\n" "$BOMBI_VERSION"
+  printf "  ${B}bombi init${N}              set up this repo          (tech lead, once)\n"
+  printf "  ${B}bombi setup${N} [agent]     set up my machine         (every dev, after cloning)\n"
+  printf "  ${B}bombi check${N}             run all gates             (you, CI, your agent)\n"
+  printf "  ${B}bombi debt${N}              list baselined violations\n"
+  printf "  ${B}bombi baseline${N}          re-record after fixing some (refuses to grow)\n"
+  printf "  ${B}bombi context${N} [topic]   dump rules + code to paste into ChatGPT\n"
+  printf "  ${B}bombi doctor${N}            what is installed, what is missing\n\n"
+  printf "  agent: claude | gemini | copilot | cursor | codex | none\n\n"
+}
+
+case "${1:-}" in
+  init)     shift; cmd_init "$@" ;;
+  setup)    shift; cmd_setup "$@" ;;
+  check)    shift; cmd_check "$@" ;;
+  baseline) shift; cmd_baseline "$@" ;;
+  debt)     shift; cmd_debt "$@" ;;
+  context)  shift; cmd_context "$@" ;;
+  doctor)   shift; cmd_doctor "$@" ;;
+  -v|--version) echo "bombi $BOMBI_VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *) err "Unknown command: $1"; usage; exit 1 ;;
+esac
