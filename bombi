@@ -132,19 +132,45 @@ ensure_uv() {
   fi
 }
 
+SPECKIT_SRC="git+https://github.com/github/spec-kit.git"
+
+# specify <args> — the installed CLI, or a one-time run through uv when it isn't installed
+specify_run() {
+  if command -v specify >/dev/null 2>&1; then specify "$@"
+  else uv tool run --from "$SPECKIT_SRC" specify "$@"; fi
+}
+
+# can spec kit run at all? installed, or one-time via uv
+specify_usable() {
+  command -v specify >/dev/null 2>&1 && return 0
+  command -v uv >/dev/null 2>&1 || return 1
+  uv tool run --from "$SPECKIT_SRC" specify --help >/dev/null 2>&1
+}
+
 ensure_specify() {
   command -v specify >/dev/null 2>&1 && { ok "spec kit $(specify --version 2>/dev/null | awk '{print $2}')"; return 0; }
   command -v uv >/dev/null 2>&1 || { warn "spec kit needs uv first"; return 1; }
   warn "spec kit (specify) is not installed"
   if ! ask "Install it now?"; then dim "skipped"; return 1; fi
   info "installing spec kit — this takes a moment"
-  uv tool install specify-cli --from git+https://github.com/github/spec-kit.git >/dev/null 2>&1 || true
+  local log; log="$(mktemp)"
+  # --force repairs a half-finished earlier install instead of refusing
+  uv tool install --force specify-cli --from "$SPECKIT_SRC" >"$log" 2>&1 || true
   export PATH="$HOME/.local/bin:$PATH"
-  if command -v specify >/dev/null 2>&1; then ok "spec kit installed"; else
-    err "spec kit install failed"
-    dim "install manually:  uv tool install specify-cli --from git+https://github.com/github/spec-kit.git"
-    return 1
+  if command -v specify >/dev/null 2>&1; then ok "spec kit installed"; rm -f "$log"; return 0; fi
+
+  err "spec kit install failed"
+  tail -n 3 "$log" | while IFS= read -r l; do dim "$l"; done
+  rm -f "$log"
+  info "trying one-time mode (runs spec kit through uv without installing it)"
+  if specify_usable; then
+    ok "spec kit available in one-time mode — bombi init will use it"
+    return 0
   fi
+  err "spec kit one-time mode failed too — check network access to github.com"
+  dim "install manually:  uv tool install specify-cli --from $SPECKIT_SRC"
+  dim "or run one-time:   uvx --from $SPECKIT_SRC specify init --here"
+  return 1
 }
 
 agent_pkg() {
@@ -391,7 +417,8 @@ gen_verify() {
     echo 'set -euo pipefail'
     if [ "$HAS_TC" = yes ]; then echo "echo '→ typecheck'; $PKG_MGR run typecheck --silent"
     else echo "# TODO enable: $PKG_MGR run typecheck"; fi
-    echo "echo '→ boundaries'; npx depcruise \"$SRC_DIR\" --config .dependency-cruiser.cjs --ignore-known"
+    echo 'KNOWN=(); [ -f .dependency-cruiser-known-violations.json ] && KNOWN=(--ignore-known)'
+    echo "echo '→ boundaries'; npx depcruise \"$SRC_DIR\" --config .dependency-cruiser.cjs \"\${KNOWN[@]+\${KNOWN[@]}}\""
     if [ "$HAS_LINT" = yes ]; then echo "echo '→ lint'; $PKG_MGR run lint --silent"
     else echo "# TODO enable: $PKG_MGR run lint"; fi
     if [ "$HAS_TEST" = yes ]; then echo "echo '→ tests'; $PKG_MGR test --silent"
@@ -452,7 +479,7 @@ gen_baseline() {
   [ -f .dependency-cruiser-known-violations.json ] && { skip ".dependency-cruiser-known-violations.json"; return; }
   info "recording existing violations…"
   if npx depcruise "$SRC_DIR" --config .dependency-cruiser.cjs --output-type baseline \
-       > .dependency-cruiser-known-violations.json 2>/dev/null; then
+       > .dependency-cruiser-known-violations.json 2>/tmp/_bombi_baseline.err; then
     local n; n=$(node -e "try{console.log(require('./.dependency-cruiser-known-violations.json').length)}catch(e){console.log(0)}")
     if [ "$n" -gt 0 ]; then
       warn "$n existing violations recorded — the build is green, but they are now visible"
@@ -463,6 +490,7 @@ gen_baseline() {
   else
     rm -f .dependency-cruiser-known-violations.json
     warn "could not record a baseline — run 'bombi baseline' after fixing the config"
+    tail -n 5 /tmp/_bombi_baseline.err | while IFS= read -r l; do dim "$l"; done
   fi
 }
 
@@ -472,7 +500,8 @@ gen_hooks() {
 # Installed by 'bombi setup' via core.hooksPath. Fast gate only — full run is 'bombi check'.
 set -euo pipefail
 SRC=$(node -e "const fs=require('fs');for(const d of ['src','app','lib','server'])if(fs.existsSync(d)){console.log(d);process.exit(0)}console.log('.')")
-npx depcruise "$SRC" --config .dependency-cruiser.cjs --ignore-known || {
+KNOWN=(); [ -f .dependency-cruiser-known-violations.json ] && KNOWN=(--ignore-known)
+npx depcruise "$SRC" --config .dependency-cruiser.cjs "${KNOWN[@]+${KNOWN[@]}}" || {
   echo; echo "✗ New architecture violation. Fix it, or commit with --no-verify if you must."; exit 1; }
 EOF
   chmod +x .githooks/pre-commit 2>/dev/null || true
@@ -614,11 +643,12 @@ wire_gitignore() {
 
 maybe_speckit() {
   if [ -d .specify ]; then ok "spec kit already initialised"; return; fi
-  if command -v specify >/dev/null 2>&1; then
+  command -v specify >/dev/null 2>&1 || info "spec kit not installed — trying one-time mode via uv…"
+  if specify_usable; then
     info "initialising spec kit…"
-    specify init --here --force --non-interactive --integration claude --ignore-agent-tools >/dev/null 2>&1 \
+    specify_run init --here --force --non-interactive --integration claude --ignore-agent-tools >/dev/null 2>&1 \
       && ok "spec kit: claude" || warn "spec kit claude init failed"
-    specify init --here --force --non-interactive --integration gemini --ignore-agent-tools >/dev/null 2>&1 \
+    specify_run init --here --force --non-interactive --integration gemini --ignore-agent-tools >/dev/null 2>&1 \
       && ok "spec kit: gemini" || true
   else
     warn "spec kit unavailable — slash commands were not installed"
@@ -680,6 +710,13 @@ cmd_setup() {
 cmd_check() {
   need_repo
   [ -x scripts/verify.sh ] || die "No scripts/verify.sh. Run 'bombi init' first."
+  if [ ! -f .dependency-cruiser-known-violations.json ] && grep -q -- '--ignore-known' scripts/verify.sh \
+     && ! grep -q 'KNOWN=' scripts/verify.sh; then
+    err "No .dependency-cruiser-known-violations.json — the boundaries check needs it."
+    dim "record it:  bombi baseline   (then commit the file)"
+    dim "if it exists on another branch or machine, it was never committed — commit it there."
+    exit 1
+  fi
   echo
   if ./scripts/verify.sh; then
     if [ -f .dependency-cruiser-known-violations.json ]; then
@@ -699,12 +736,23 @@ cmd_baseline() {
   need_repo
   [ -f .dependency-cruiser.cjs ] || die "No .dependency-cruiser.cjs. Run 'bombi init' first."
   survey
-  local before=0
-  [ -f .dependency-cruiser-known-violations.json ] && \
+  local before=0 first=no
+  if [ -f .dependency-cruiser-known-violations.json ]; then
     before=$(node -e "try{console.log(require('./.dependency-cruiser-known-violations.json').length)}catch(e){console.log(0)}")
+  else
+    first=yes
+  fi
   npx depcruise "$SRC_DIR" --config .dependency-cruiser.cjs --output-type baseline \
-    > /tmp/_bombi_baseline.json 2>/dev/null || die "depcruise failed — check .dependency-cruiser.cjs"
+    > /tmp/_bombi_baseline.json 2>/tmp/_bombi_baseline.err || {
+    tail -n 5 /tmp/_bombi_baseline.err | while IFS= read -r l; do dim "$l"; done
+    die "depcruise failed — check .dependency-cruiser.cjs"; }
   local after; after=$(node -e "console.log(require('/tmp/_bombi_baseline.json').length)")
+  if [ "$first" = yes ]; then
+    mv /tmp/_bombi_baseline.json .dependency-cruiser-known-violations.json
+    ok "baseline recorded: $after known violations"
+    dim "commit .dependency-cruiser-known-violations.json — it should only ever shrink"
+    return
+  fi
   if [ "$after" -gt "$before" ]; then
     err "Baseline would GROW: $before → $after"
     dim "New violations must be fixed, not recorded. Run 'bombi check' to see them."
@@ -772,7 +820,7 @@ cmd_doctor() {
     command -v node    >/dev/null 2>&1 && ok "node $(node -v)"                                   || warn "node — missing"
     command -v git     >/dev/null 2>&1 && ok "$(git --version)"                                  || warn "git — missing"
     command -v uv      >/dev/null 2>&1 && ok "uv $(uv --version 2>/dev/null | awk '{print $2}')"  || warn "uv — missing (spec kit needs it)"
-    command -v specify >/dev/null 2>&1 && ok "spec kit $(specify --version 2>/dev/null | awk '{print $2}')" || warn "spec kit — missing"
+    command -v specify >/dev/null 2>&1 && ok "spec kit $(specify --version 2>/dev/null | awk '{print $2}')" || { command -v uv >/dev/null 2>&1 && dim "spec kit — not installed (bombi init will use one-time mode via uv)" || warn "spec kit — missing"; }
   fi
 
   echo
