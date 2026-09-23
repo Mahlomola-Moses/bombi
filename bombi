@@ -36,6 +36,179 @@ has_script() { node -e "process.exit(require('./package.json').scripts?.['$1']?0
 has_dep() { node -e "const p=require('./package.json');process.exit(((p.dependencies||{})['$1']||(p.devDependencies||{})['$1'])?0:1)" 2>/dev/null; }
 
 # ═══════════════════════════════════════════════════════════════
+# environment detection + repair
+# ═══════════════════════════════════════════════════════════════
+BOMBI_ASSUME_YES=${BOMBI_ASSUME_YES:-no}
+
+ask() {   # ask "question" -> 0 for yes
+  [ "$BOMBI_ASSUME_YES" = yes ] && return 0
+  [ -t 0 ] || return 1                      # non-interactive: never assume consent
+  printf "  ${Y}?${N} %s [Y/n] " "$1"
+  local a; read -r a || return 1
+  case "${a:-y}" in [Yy]*|"") return 0 ;; *) return 1 ;; esac
+}
+
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) OS=macos ;;
+    Linux)  OS=linux ;;
+    MINGW*|MSYS*|CYGWIN*) OS=windows ;;
+    *) OS=unknown ;;
+  esac
+  ARCH="$(uname -m)"
+}
+
+# Which rc file does this user's shell actually read for a login/interactive shell?
+detect_shell_rc() {
+  SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
+  case "$SHELL_NAME" in
+    zsh)  SHELL_RC="${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash)
+      # macOS Terminal starts login shells, which read .bash_profile, not .bashrc
+      if [ "$OS" = macos ] && [ -f "$HOME/.bash_profile" ]; then SHELL_RC="$HOME/.bash_profile"
+      elif [ "$OS" = macos ]; then SHELL_RC="$HOME/.bash_profile"
+      else SHELL_RC="$HOME/.bashrc"; fi ;;
+    fish) SHELL_RC="$HOME/.config/fish/config.fish" ;;
+    ksh)  SHELL_RC="$HOME/.kshrc" ;;
+    *)    SHELL_RC="$HOME/.profile" ;;
+  esac
+}
+
+path_has() { case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac; }
+
+# Idempotently add ~/.local/bin to PATH in the right rc file
+ensure_path() {
+  local dir="$HOME/.local/bin"
+  mkdir -p "$dir"
+  if path_has "$dir"; then ok "PATH includes ~/.local/bin"; return 0; fi
+
+  detect_shell_rc
+  # already written but not yet sourced?
+  if [ -f "$SHELL_RC" ] && grep -q '\.local/bin' "$SHELL_RC" 2>/dev/null; then
+    warn "PATH line is in $(basename "$SHELL_RC") but this shell hasn't loaded it"
+    dim "run:  source $SHELL_RC     (or open a new terminal)"
+    export PATH="$dir:$PATH"
+    return 0
+  fi
+
+  warn "~/.local/bin is not on your PATH"
+  dim "shell: $SHELL_NAME   file: $SHELL_RC"
+  if ask "Add it to $(basename "$SHELL_RC")?"; then
+    if [ "$SHELL_NAME" = fish ]; then
+      mkdir -p "$(dirname "$SHELL_RC")"
+      printf '\n# added by bombi\nfish_add_path %s\n' "$dir" >> "$SHELL_RC"
+    else
+      printf '\n# added by bombi\nexport PATH="%s:$PATH"\n' "\$HOME/.local/bin" >> "$SHELL_RC"
+    fi
+    export PATH="$dir:$PATH"
+    ok "added to $SHELL_RC"
+    dim "active in new terminals; for this one:  source $SHELL_RC"
+  else
+    dim "skipped — add manually:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    return 1
+  fi
+}
+
+have_brew() { command -v brew >/dev/null 2>&1; }
+
+ensure_uv() {
+  command -v uv >/dev/null 2>&1 && { ok "uv $(uv --version 2>/dev/null | awk '{print $2}')"; return 0; }
+  warn "uv is not installed (Spec Kit needs it)"
+  if ! ask "Install uv now?"; then dim "skipped — https://docs.astral.sh/uv/"; return 1; fi
+  if [ "$OS" = macos ] && have_brew; then
+    info "brew install uv"; brew install uv >/dev/null 2>&1 || true
+  elif [ "$OS" = macos ]; then
+    warn "Homebrew not found — using the official installer instead"
+    { curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh; } >/dev/null 2>&1 || true
+  else
+    { curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh; } >/dev/null 2>&1 || \
+      pip install uv --quiet --break-system-packages >/dev/null 2>&1 || true
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
+  if command -v uv >/dev/null 2>&1; then ok "uv installed"; else
+    err "uv install failed — no network, or a proxy is blocking astral.sh"
+    dim "install manually:  brew install uv   (or see https://docs.astral.sh/uv/)"
+    return 1
+  fi
+}
+
+ensure_specify() {
+  command -v specify >/dev/null 2>&1 && { ok "spec kit $(specify --version 2>/dev/null | awk '{print $2}')"; return 0; }
+  command -v uv >/dev/null 2>&1 || { warn "spec kit needs uv first"; return 1; }
+  warn "spec kit (specify) is not installed"
+  if ! ask "Install it now?"; then dim "skipped"; return 1; fi
+  info "installing spec kit — this takes a moment"
+  uv tool install specify-cli --from git+https://github.com/github/spec-kit.git >/dev/null 2>&1 || true
+  export PATH="$HOME/.local/bin:$PATH"
+  if command -v specify >/dev/null 2>&1; then ok "spec kit installed"; else
+    err "spec kit install failed"
+    dim "install manually:  uv tool install specify-cli --from git+https://github.com/github/spec-kit.git"
+    return 1
+  fi
+}
+
+agent_pkg() {
+  case "$1" in
+    claude) echo "@anthropic-ai/claude-code" ;;
+    gemini) echo "@google/gemini-cli" ;;
+    codex)  echo "@openai/codex" ;;
+    *) echo "" ;;
+  esac
+}
+
+ensure_agent() {
+  local a="$1" pkg; pkg="$(agent_pkg "$a")"
+  case "$a" in
+    copilot) dim "install the GitHub Copilot extension in your editor"; return 0 ;;
+    cursor)
+      if [ "$OS" = macos ] && have_brew; then
+        command -v cursor >/dev/null 2>&1 && { ok "cursor installed"; return 0; }
+        ask "Install Cursor via Homebrew?" && { brew install --cask cursor >/dev/null 2>&1 && ok "cursor installed"; }
+      else dim "download Cursor from https://cursor.com"; fi
+      return 0 ;;
+    none) return 0 ;;
+  esac
+  [ -n "$pkg" ] || return 0
+  command -v "$a" >/dev/null 2>&1 && { ok "$a installed"; return 0; }
+  command -v npm >/dev/null 2>&1 || { warn "$a needs npm"; return 1; }
+  warn "$a is not installed"
+  if ! ask "Install $pkg globally?"; then dim "skipped — npm i -g $pkg"; return 1; fi
+  info "npm i -g $pkg"
+  npm install -g "$pkg" >/dev/null 2>&1 || true
+  command -v "$a" >/dev/null 2>&1 && ok "$a installed" || { err "install failed — try: npm i -g $pkg"; return 1; }
+}
+
+ensure_node() {
+  if command -v node >/dev/null 2>&1; then
+    local major; major="$(node -v | sed 's/v\([0-9]*\).*/\1/')"
+    if [ "$major" -lt 18 ] 2>/dev/null; then
+      warn "node $(node -v) is too old — bombi needs 18+"
+      [ "$OS" = macos ] && have_brew && ask "Upgrade node via Homebrew?" && brew upgrade node >/dev/null 2>&1
+    else
+      ok "node $(node -v)"
+    fi
+    return 0
+  fi
+  warn "Node.js is not installed"
+  if [ "$OS" = macos ] && have_brew && ask "Install node via Homebrew?"; then
+    brew install node >/dev/null 2>&1 && ok "node installed" && return 0
+  fi
+  err "install Node 18+ — https://nodejs.org"
+  return 1
+}
+
+# Everything the machine needs, repaired in dependency order
+ensure_environment() {
+  detect_os
+  detect_shell_rc
+  ok "os: $OS ($ARCH)   shell: $SHELL_NAME"
+  ensure_path || true
+  ensure_node || return 1
+  ensure_uv || true
+  ensure_specify || true
+}
+
+# ═══════════════════════════════════════════════════════════════
 # survey — populates globals used by init
 # ═══════════════════════════════════════════════════════════════
 survey() {
@@ -83,6 +256,9 @@ cmd_init() {
   need_repo
   [ -f package.json ] || die "No package.json here. bombi currently supports Node projects."
   command -v node >/dev/null || die "Node.js is required."
+
+  echo; info "Checking your environment…"
+  ensure_environment || warn "environment incomplete — 'bombi doctor --fix' later"
 
   echo; info "Surveying the repository…"
   survey
@@ -445,8 +621,8 @@ maybe_speckit() {
     specify init --here --force --non-interactive --integration gemini --ignore-agent-tools >/dev/null 2>&1 \
       && ok "spec kit: gemini" || true
   else
-    warn "spec kit not installed — install it, then rerun 'bombi init':"
-    dim "uv tool install specify-cli --from git+https://github.com/github/spec-kit.git"
+    warn "spec kit unavailable — slash commands were not installed"
+    dim "fix with: bombi doctor --fix, then rerun bombi init"
   fi
 }
 
@@ -458,8 +634,8 @@ cmd_setup() {
   local agent="${1:-}"
   printf "\n  bombi setup\n  ───────────\n\n"
 
-  command -v node >/dev/null || die "Node.js not found. Install Node 18+."
-  ok "node $(node -v)"
+  # everything the machine needs, detected and fixed
+  ensure_environment || die "could not prepare the environment"
 
   if [ -f package.json ]; then
     if [ -f package-lock.json ]; then info "npm ci"; npm ci --silent
@@ -483,24 +659,18 @@ cmd_setup() {
                  4) agent=cursor;; 5) agent=codex;;  *) agent=none;; esac
   fi
   ok "agent: $agent"
+  ensure_agent "$agent" || true
 
-  case "$agent" in
-    claude) command -v claude >/dev/null && ok "claude code installed" \
-              || { warn "not installed:"; dim "npm i -g @anthropic-ai/claude-code"; } ;;
-    gemini) command -v gemini >/dev/null && ok "gemini cli installed" \
-              || { warn "not installed:"; dim "npm i -g @google/gemini-cli"; } ;;
-    codex)  command -v codex >/dev/null && ok "codex cli installed" \
-              || { warn "not installed:"; dim "npm i -g @openai/codex"; } ;;
-    copilot) dim "install the GitHub Copilot extension in your editor" ;;
-    cursor)  dim "download Cursor from https://cursor.com" ;;
-  esac
-
-  [ -d .specify ] && ok "spec kit commands available" || warn "spec kit not set up in this repo"
+  [ -d .specify ] && ok "spec kit commands available in this repo" \
+                  || warn "spec kit not set up here — ask whoever ran 'bombi init'"
 
   printf "\n${G}  Ready.${N}\n\n"
   dim "Read    AI-QUICKSTART.md   (2 minutes — please actually read it)"
   dim "Check   bombi check"
   dim "Build   open your agent, run /speckit.specify \"<requirement>\""
+  if [ -n "${SHELL_RC:-}" ] && ! path_has "$HOME/.local/bin"; then
+    echo; dim "one-time:  source $SHELL_RC"
+  fi
   echo
 }
 
@@ -582,26 +752,54 @@ cmd_context() {
 # bombi doctor
 # ═══════════════════════════════════════════════════════════════
 cmd_doctor() {
-  printf "\n  bombi doctor\n  ────────────\n\n"
-  check() { if command -v "$1" >/dev/null 2>&1; then ok "$1  ${D}$(${2:-echo} 2>/dev/null | head -1)${N}"; else warn "$1 — not installed"; fi; }
-  check node "node -v"
-  check git "git --version"
-  check specify "specify --version"
+  local fix=no
+  [ "${1:-}" = "--fix" ] || [ "${1:-}" = "-f" ] && fix=yes
+  printf "\n  bombi doctor%s\n  ────────────%s\n\n" \
+    "$([ $fix = yes ] && echo " --fix")" "$([ $fix = yes ] && echo "──────")"
+
+  detect_os; detect_shell_rc
+  ok "os: $OS ($ARCH)   shell: $SHELL_NAME   rc: $(basename "$SHELL_RC")"
+  echo
+
+  if [ "$fix" = yes ]; then
+    ensure_path || true
+    ensure_node || true
+    ensure_uv || true
+    ensure_specify || true
+  else
+    path_has "$HOME/.local/bin" && ok "PATH includes ~/.local/bin" \
+      || warn "~/.local/bin not on PATH — run 'bombi doctor --fix'"
+    command -v node    >/dev/null 2>&1 && ok "node $(node -v)"                                   || warn "node — missing"
+    command -v git     >/dev/null 2>&1 && ok "$(git --version)"                                  || warn "git — missing"
+    command -v uv      >/dev/null 2>&1 && ok "uv $(uv --version 2>/dev/null | awk '{print $2}')"  || warn "uv — missing (spec kit needs it)"
+    command -v specify >/dev/null 2>&1 && ok "spec kit $(specify --version 2>/dev/null | awk '{print $2}')" || warn "spec kit — missing"
+  fi
+
   echo
   for a in claude gemini codex cursor; do
     command -v "$a" >/dev/null 2>&1 && ok "agent: $a" || dim "agent: $a (not installed)"
   done
   echo
+
   if [ -d .git ]; then
     for f in AGENTS.md CLAUDE.md .dependency-cruiser.cjs scripts/verify.sh .specify/memory/constitution.md; do
       [ -e "$f" ] && ok "$f" || warn "$f missing — run 'bombi init'"
     done
-    [ -f .dependency-cruiser-known-violations.json ] && \
-      dim "baselined violations: $(node -e "try{console.log(require('./.dependency-cruiser-known-violations.json').length)}catch(e){console.log(0)}")"
-    [ "$(git config core.hooksPath 2>/dev/null)" = ".githooks" ] && ok "git hooks active" || warn "git hooks inactive — run 'bombi setup'"
+    if [ -f .dependency-cruiser-known-violations.json ]; then
+      dim "baselined violations: $(node -e "try{console.log(require('./.dependency-cruiser-known-violations.json').length)}catch(e){console.log(0)}" 2>/dev/null || echo '?')"
+    fi
+    if [ "$(git config core.hooksPath 2>/dev/null)" = ".githooks" ]; then ok "git hooks active"
+    elif [ -d .githooks ]; then
+      warn "git hooks inactive"
+      if [ "$fix" = yes ] && ask "Enable them now?"; then
+        git config core.hooksPath .githooks; chmod +x .githooks/* 2>/dev/null || true; ok "git hooks enabled"
+      else dim "run 'bombi setup'"; fi
+    fi
   else
     dim "not in a git repository"
   fi
+  echo
+  [ "$fix" = no ] && dim "fix what's missing:  bombi doctor --fix"
   echo
 }
 
@@ -614,9 +812,16 @@ usage() {
   printf "  ${B}bombi debt${N}              list baselined violations\n"
   printf "  ${B}bombi baseline${N}          re-record after fixing some (refuses to grow)\n"
   printf "  ${B}bombi context${N} [topic]   dump rules + code to paste into ChatGPT\n"
-  printf "  ${B}bombi doctor${N}            what is installed, what is missing\n\n"
-  printf "  agent: claude | gemini | copilot | cursor | codex | none\n\n"
+  printf "  ${B}bombi doctor${N} [--fix]     check the machine, and repair it with --fix\n\n"
+  printf "  agent: claude | gemini | copilot | cursor | codex | none\n"
+  printf "  flags: -y / --yes   answer yes to every prompt (CI, scripts)\n\n"
 }
+
+# global flags
+for a in "$@"; do
+  case "$a" in -y|--yes) BOMBI_ASSUME_YES=yes ;; esac
+done
+set -- $(printf '%s\n' "$@" | grep -vE '^(-y|--yes)$' || true)
 
 case "${1:-}" in
   init)     shift; cmd_init "$@" ;;
@@ -625,7 +830,7 @@ case "${1:-}" in
   baseline) shift; cmd_baseline "$@" ;;
   debt)     shift; cmd_debt "$@" ;;
   context)  shift; cmd_context "$@" ;;
-  doctor)   shift; cmd_doctor "$@" ;;
+  doctor)   shift; cmd_doctor "${1:-}" ;;
   -v|--version) echo "bombi $BOMBI_VERSION" ;;
   ""|-h|--help|help) usage ;;
   *) err "Unknown command: $1"; usage; exit 1 ;;

@@ -8,12 +8,17 @@ enforced by the same build — without anyone configuring anything.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Mahlomola-Moses/bombi/main/install.sh | bash
+bombi doctor --fix        # sets up PATH, node, uv and spec kit for you
 
 cd your-repo
-bombi init          # tech lead, once
-bombi setup         # every dev, after cloning
-bombi check         # before every PR
+bombi init                # tech lead, once
+bombi setup               # every dev, after cloning
+bombi check               # before every PR
 ```
+
+Nothing to configure by hand. `bombi` detects your OS and shell — macOS zsh gets
+`~/.zshrc`, macOS bash gets `~/.bash_profile` (the login-shell quirk), Linux bash
+gets `~/.bashrc`, fish gets `fish_add_path` — then installs what is missing.
 
 ---
 
@@ -105,11 +110,17 @@ dependency bumps.
 
 ## Requirements
 
-Node 18+ and git. Spec Kit is optional but recommended:
+Node 18+ and git. Everything else — `uv`, Spec Kit, your agent's CLI — is detected
+and offered by `bombi doctor --fix` and `bombi setup`.
 
-```bash
-uv tool install specify-cli --from git+https://github.com/github/spec-kit.git
 ```
+bombi doctor          # what's installed, what's missing (read-only)
+bombi doctor --fix    # fix it
+bombi doctor --fix -y # fix it without prompting (CI, scripts)
+```
+
+On macOS it prefers Homebrew when available and falls back to the official
+installers. Every repair is idempotent: re-running never duplicates a PATH line.
 
 ---
 
