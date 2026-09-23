@@ -743,8 +743,12 @@ wire_gitignore() {
   ok ".gitignore"
 }
 
+# installed = the files exist, not just the folders (a discard in a git GUI leaves empty dirs)
+speckit_installed() { [ -f .specify/templates/spec-template.md ] && ls .claude/skills/speckit-*/SKILL.md >/dev/null 2>&1; }
+
 maybe_speckit() {
-  if [ -d .specify ]; then ok "spec kit already initialised"; return; fi
+  if speckit_installed; then ok "spec kit already initialised"; return; fi
+  [ -d .specify ] && warn "spec kit folders exist but are empty or incomplete — reinstalling"
   command -v specify >/dev/null 2>&1 || info "spec kit not installed — trying one-time mode via uv…"
   if specify_usable; then
     info "initialising spec kit…"
@@ -793,7 +797,7 @@ cmd_setup() {
   ok "agent: $agent"
   ensure_agent "$agent" || true
 
-  [ -d .specify ] && ok "spec kit commands available in this repo" \
+  speckit_installed && ok "spec kit commands available in this repo" \
                   || warn "spec kit not set up here — ask whoever ran 'bombi init'"
 
   printf "\n${G}  Ready.${N}\n\n"
@@ -1002,6 +1006,14 @@ cmd_update() {
     install_depcruise
     gen_baseline
   fi
+
+  # team-owned files: recreated only if missing (e.g. discarded in a git GUI), never overwritten
+  echo; info "restoring anything missing…"
+  gen_agents_md
+  gen_pointers
+  gen_quickstart
+  wire_gitignore
+  maybe_speckit
   echo
   printf "${G}  Updated.${N} Review with 'git diff', then run: bombi check\n\n"
 }
