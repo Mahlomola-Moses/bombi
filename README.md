@@ -71,6 +71,13 @@ list. The number only goes down.
   New violations must be fixed, not recorded.
 ```
 
+Not ready to enforce boundaries on an old project at all? Skip them:
+
+```bash
+bombi init --no-boundaries        # AI setup + your existing gates, no dependency-cruiser
+bombi update --boundaries         # turn them on later
+```
+
 ---
 
 ## Commands
@@ -81,9 +88,17 @@ bombi setup [agent]     set up my machine         (every dev, after cloning)
 bombi check             run all gates             (you, CI, your agent)
 bombi debt              list baselined violations
 bombi baseline          re-record after fixing some
+bombi update            refresh bombi's generated tooling in this repo
+bombi upgrade           replace this bombi with the latest release
 bombi context [topic]   dump rules + code to paste into ChatGPT
 bombi doctor            what's installed, what's missing
 ```
+
+`bombi update` rewrites only the files bombi owns — `scripts/verify.sh`,
+`.dependency-cruiser.cjs`, `.githooks/pre-commit` and the CI workflow — and only
+when git can restore the old version. `AGENTS.md` and the quickstart are yours and
+are never touched. Preview with `--dry-run`; `--force` replaces edited files and
+keeps a `.bak`. After `bombi upgrade`, run `bombi update` in each repo.
 
 `agent` is one of: `claude` `gemini` `copilot` `cursor` `codex` `none`
 

@@ -5,12 +5,14 @@
 #   bombi setup     set up my machine       (every dev, after cloning)
 #   bombi check     is this repo compliant? (you, CI, or your agent)
 #   bombi baseline  re-record known violations after fixing some
+#   bombi update    refresh bombi's generated tooling in this repo
+#   bombi upgrade   replace this bombi with the latest release
 #   bombi doctor    what's installed, what's missing
 #
 # Detects greenfield vs legacy and does the right thing either way.
 
 set -euo pipefail
-BOMBI_VERSION="1.0.0"
+BOMBI_VERSION="1.1.0"
 
 # ANSI-C quoting so the escapes are real characters, usable inside %s too
 B=$'\033[0;34m'; G=$'\033[0;32m'; Y=$'\033[0;33m'; R=$'\033[0;31m'; D=$'\033[0;90m'; N=$'\033[0m'
@@ -25,11 +27,62 @@ skip() { printf "${Y}·${N} %s ${D}(exists, left alone)${N}\n" "$1"; }
 die() { err "$1"; exit 1; }
 need_repo() { [ -d .git ] || die "Not a git repository. Run bombi from your repo root."; }
 
-# write <path> — content on stdin; never overwrites
+# write <path> — content on stdin; never overwrites (except under 'bombi update')
+UPDATING=no; DRY_RUN=no; FORCE=no
 write() {
   local p="$1"
+  [ "$UPDATING" = yes ] && { sync_file "$p"; return; }
   if [ -e "$p" ]; then skip "$p"; cat >/dev/null; return 0; fi
   mkdir -p "$(dirname "$p")"; cat > "$p"; ok "$p"
+}
+
+# tracked, and no edits beyond what git already holds — so git can undo a replace
+git_restorable() { git ls-files --error-unmatch "$1" >/dev/null 2>&1 && git diff --quiet -- "$1"; }
+
+# sync_file <path> — content on stdin; replace only when git can restore the old one
+sync_file() {
+  local p="$1" new; new="$(mktemp)"; cat > "$new"
+  if [ ! -e "$p" ]; then
+    if [ "$DRY_RUN" = yes ]; then warn "$p would be created"
+    else mkdir -p "$(dirname "$p")"; cat "$new" > "$p"; ok "$p ${D}(created)${N}"; fi
+  elif cmp -s "$new" "$p"; then
+    ok "$p ${D}(up to date)${N}"
+  elif [ "$DRY_RUN" = yes ]; then
+    warn "$p would change:"
+    diff -u "$p" "$new" | tail -n +3 | sed 's/^/      /' | head -40 || true
+  elif git_restorable "$p"; then
+    cat "$new" > "$p"; ok "$p ${D}(updated — 'git diff $p' to review)${N}"
+  elif [ "$FORCE" = yes ]; then
+    cp "$p" "$p.bak"; cat "$new" > "$p"; ok "$p ${D}(replaced — old copy in $p.bak)${N}"
+  else
+    warn "$p has changes git can't restore — left alone"
+    dim "commit or stage it first, or rerun with --force (keeps a .bak)"
+  fi
+  rm -f "$new"
+}
+
+# remove_managed <path> — same safety rules as sync_file
+remove_managed() {
+  local p="$1"
+  [ -e "$p" ] || return 0
+  if [ "$DRY_RUN" = yes ]; then warn "$p would be removed"
+  elif git_restorable "$p"; then rm -f "$p"; ok "$p ${D}(removed)${N}"
+  elif [ "$FORCE" = yes ]; then mv "$p" "$p.bak"; ok "$p ${D}(removed — old copy in $p.bak)${N}"
+  else warn "$p has changes git can't restore — left alone (use --force)"; fi
+}
+
+# per-repo settings live under "bombi" in package.json
+# setting <key> <default>  /  set_setting <key> <true|false>
+setting() {
+  node -e 'try{const v=(require(process.cwd()+"/package.json").bombi||{})[process.argv[1]];console.log(v===undefined?process.argv[2]:v)}catch(e){console.log(process.argv[2])}' "$1" "$2"
+}
+set_setting() {
+  node -e '
+    const fs=require("fs"),[k,v]=process.argv.slice(1);
+    const p=JSON.parse(fs.readFileSync("package.json","utf8"));
+    if (((p.bombi||{})[k] ?? true) === (v==="true")) process.exit(0);   // unchanged: leave the file alone
+    p.bombi=Object.assign({},p.bombi,{[k]:v==="true"});
+    fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n");' "$1" "$2"
 }
 
 has_script() { node -e "process.exit(require('./package.json').scripts?.['$1']?0:1)" 2>/dev/null; }
@@ -238,6 +291,7 @@ ensure_environment() {
 # survey — populates globals used by init
 # ═══════════════════════════════════════════════════════════════
 survey() {
+  BOUNDARIES="${BOUNDARIES:-$( [ "$(setting boundaries true)" = false ] && echo no || echo yes )}"
   PKG_MGR=npm
   [ -f yarn.lock ] && PKG_MGR=yarn
   [ -f pnpm-lock.yaml ] && PKG_MGR=pnpm
@@ -254,7 +308,9 @@ survey() {
   STACK="$(echo "$STACK" | sed 's/^ *//')"
 
   SRC_DIR=src
-  [ -d src ] || SRC_DIR="$(ls -d app lib server 2>/dev/null | head -1 || echo .)"
+  # ls exits non-zero when any candidate is missing; that must not trip set -e
+  [ -d src ] || SRC_DIR="$(ls -d app lib server apps packages 2>/dev/null | head -1 || true)"
+  SRC_DIR="${SRC_DIR:-.}"
   SRC_DIR="${SRC_DIR%/}"
 
   LAYERS="$(ls -d "$SRC_DIR"/*/ 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ' || true)"
@@ -279,6 +335,12 @@ survey() {
 # bombi init
 # ═══════════════════════════════════════════════════════════════
 cmd_init() {
+  for a in "$@"; do
+    case "$a" in
+      --no-boundaries) BOUNDARIES=no ;;
+      *) die "Unknown option for init: $a" ;;
+    esac
+  done
   need_repo
   [ -f package.json ] || die "No package.json here. bombi currently supports Node projects."
   command -v node >/dev/null || die "Node.js is required."
@@ -294,15 +356,21 @@ cmd_init() {
   ok "gates present — typecheck: $HAS_TC  lint: $HAS_LINT  test: $HAS_TEST"
   ok "source: $SRC_DIR/  data layer: $SRC_DIR/$DATA_DIR/"
   ok "stack: ${STACK:-none detected}"
+  [ "$BOUNDARIES" = yes ] && ok "boundaries: enforced" \
+    || ok "boundaries: off ${D}(--no-boundaries; turn on later with 'bombi update --boundaries')${N}"
   echo
 
   gen_agents_md
   gen_pointers
   gen_verify
-  gen_depcruise
-  install_depcruise
-  gen_baseline
-  gen_hooks
+  if [ "$BOUNDARIES" = yes ]; then
+    gen_depcruise
+    install_depcruise
+    gen_baseline
+    gen_hooks
+  else
+    set_setting boundaries false
+  fi
   gen_quickstart
   gen_ci
   wire_package_json
@@ -348,12 +416,16 @@ gen_agents_md() {
     if [ "$MODE" = legacy ]; then
       echo
       echo "## This is an existing codebase — read before changing anything"
+      if [ "$BOUNDARIES" = yes ]; then
       echo "- Not all existing code follows the rules below. Known exceptions are in"
       echo "  \`.dependency-cruiser-known-violations.json\`."
+      else
+      echo "- Not all existing code follows the rules below."
+      fi
       echo "- **Do not bulk-refactor them.** Leave old code alone unless the task is"
       echo "  explicitly a refactor."
-      echo "- New and modified code MUST follow the rules. The baseline forgives only"
-      echo "  what was already there, and it should only ever shrink."
+      echo "- New and modified code MUST follow the rules."
+      [ "$BOUNDARIES" = yes ] && echo "  The baseline forgives only what was already there, and it should only ever shrink."
       echo "- Before adding anything, search for an existing implementation and extend"
       echo "  it. Building a second version of something that exists is the most common"
       echo "  failure mode here."
@@ -362,7 +434,7 @@ gen_agents_md() {
     echo
     echo "## Architecture principles"
     echo "Governed by \`.specify/memory/constitution.md\`. Read it before planning any"
-    echo "change. Boundaries are enforced mechanically by \`.dependency-cruiser.cjs\`."
+    [ "$BOUNDARIES" = yes ] && echo "change. Boundaries are enforced mechanically by \`.dependency-cruiser.cjs\`." || echo "change."
     echo
     echo "## Working rules"
     echo "- Ambiguous requirement → ask. Do not guess and build."
@@ -417,8 +489,12 @@ gen_verify() {
     echo 'set -euo pipefail'
     if [ "$HAS_TC" = yes ]; then echo "echo '→ typecheck'; $PKG_MGR run typecheck --silent"
     else echo "# TODO enable: $PKG_MGR run typecheck"; fi
-    echo 'KNOWN=(); [ -f .dependency-cruiser-known-violations.json ] && KNOWN=(--ignore-known)'
-    echo "echo '→ boundaries'; npx depcruise \"$SRC_DIR\" --config .dependency-cruiser.cjs \"\${KNOWN[@]+\${KNOWN[@]}}\""
+    if [ "$BOUNDARIES" = yes ]; then
+      echo 'KNOWN=(); [ -f .dependency-cruiser-known-violations.json ] && KNOWN=(--ignore-known)'
+      echo "echo '→ boundaries'; npx depcruise \"$SRC_DIR\" --config .dependency-cruiser.cjs \"\${KNOWN[@]+\${KNOWN[@]}}\""
+    else
+      echo "# boundaries off for this repo — turn on with: bombi update --boundaries"
+    fi
     if [ "$HAS_LINT" = yes ]; then echo "echo '→ lint'; $PKG_MGR run lint --silent"
     else echo "# TODO enable: $PKG_MGR run lint"; fi
     if [ "$HAS_TEST" = yes ]; then echo "echo '→ tests'; $PKG_MGR test --silent"
@@ -429,7 +505,29 @@ gen_verify() {
   chmod +x scripts/verify.sh 2>/dev/null || true
 }
 
+# First tsconfig that TypeScript can load AND that covers files under SRC_DIR.
+# A root tsconfig.json with include ["src/**/*"] in a repo without src/ makes
+# depcruise die with TS18003 "No inputs were found".
+pick_tsconfig() {
+  node -e '
+    let ts; try { ts = require(process.cwd() + "/node_modules/typescript"); } catch (e) { process.exit(1); }
+    const path = require("path"), src = path.resolve(process.argv[1]);
+    for (const f of ["tsconfig.json", "tsconfig.base.json", "tsconfig.app.json"]) {
+      const r = ts.readConfigFile(f, ts.sys.readFile);
+      if (r.error) continue;
+      const cfg = ts.parseJsonConfigFileContent(r.config, ts.sys, process.cwd());
+      if (cfg.fileNames.some(n => path.resolve(n).startsWith(src))) { console.log(f); process.exit(0); }
+    }
+    process.exit(1);' "$SRC_DIR" 2>/dev/null
+}
+
 gen_depcruise() {
+  # rule paths are relative to the repo root, so "." contributes no prefix
+  local P="$SRC_DIR/"; [ "$SRC_DIR" = . ] && P=""
+  local TSC=""; [ "$HAS_TS" = yes ] && TSC="$(pick_tsconfig || true)"
+  if [ "$HAS_TS" = yes ] && [ -z "$TSC" ]; then
+    warn "no tsconfig covers $SRC_DIR — depcruise will run without one (path aliases won't resolve)"
+  fi
   {
     echo "/** Architecture boundaries, generated by bombi."
     echo " *  Pre-existing violations live in .dependency-cruiser-known-violations.json"
@@ -440,28 +538,28 @@ gen_depcruise() {
     echo "      name: 'no-data-access-outside-$DATA_DIR',"
     echo "      severity: 'error',"
     echo "      comment: 'Only the data layer may import the database client.',"
-    echo "      from: { pathNot: '^$SRC_DIR/$DATA_DIR' },"
-    echo "      to:   { path: '^$SRC_DIR/$DATA_DIR/(db|database|knex|connection|client)' },"
+    echo "      from: { pathNot: '^${P}$DATA_DIR' },"
+    echo "      to:   { path: '^${P}$DATA_DIR/(db|database|knex|connection|client)' },"
     echo "    },"
     echo "    {"
     echo "      name: 'no-$DATA_DIR-from-controller',"
     echo "      severity: 'error',"
     echo "      comment: 'Controllers talk to services, never straight to the data layer.',"
-    echo "      from: { path: '^$SRC_DIR/controllers' },"
-    echo "      to:   { path: '^$SRC_DIR/$DATA_DIR' },"
+    echo "      from: { path: '^${P}controllers' },"
+    echo "      to:   { path: '^${P}$DATA_DIR' },"
     echo "    },"
     echo "    {"
     echo "      name: 'no-controller-from-service',"
     echo "      severity: 'error',"
     echo "      comment: 'Services must not know HTTP exists.',"
-    echo "      from: { path: '^$SRC_DIR/services' },"
-    echo "      to:   { path: '^$SRC_DIR/controllers' },"
+    echo "      from: { path: '^${P}services' },"
+    echo "      to:   { path: '^${P}controllers' },"
     echo "    },"
     echo "    { name: 'no-circular', severity: 'error', from: {}, to: { circular: true } },"
     echo "  ],"
     echo "  options: {"
     echo "    doNotFollow: { path: 'node_modules' },"
-    [ "$HAS_TS" = yes ] && echo "    tsConfig: { fileName: 'tsconfig.json' },"
+    [ -n "$TSC" ] && echo "    tsConfig: { fileName: '$TSC' },"
     echo "  },"
     echo "};"
   } > /tmp/_bombi_dc.cjs
@@ -499,7 +597,7 @@ gen_hooks() {
 #!/usr/bin/env bash
 # Installed by 'bombi setup' via core.hooksPath. Fast gate only — full run is 'bombi check'.
 set -euo pipefail
-SRC=$(node -e "const fs=require('fs');for(const d of ['src','app','lib','server'])if(fs.existsSync(d)){console.log(d);process.exit(0)}console.log('.')")
+SRC=$(node -e "const fs=require('fs');for(const d of ['src','app','lib','server','apps','packages'])if(fs.existsSync(d)){console.log(d);process.exit(0)}console.log('.')")
 KNOWN=(); [ -f .dependency-cruiser-known-violations.json ] && KNOWN=(--ignore-known)
 npx depcruise "$SRC" --config .dependency-cruiser.cjs "${KNOWN[@]+${KNOWN[@]}}" || {
   echo; echo "✗ New architecture violation. Fix it, or commit with --no-verify if you must."; exit 1; }
@@ -521,10 +619,10 @@ same ones. You configure nothing; it is already committed.
 ## The rules
 - `AGENTS.md` — stack, commands, conventions. Read automatically by every major agent.
 - `.specify/memory/constitution.md` — architecture principles. Non-negotiable.
-- `.dependency-cruiser.cjs` — the same rules, mechanically enforced.
-
 HEAD
-    if [ "$MODE" = legacy ]; then
+    [ "$BOUNDARIES" = yes ] && echo '- `.dependency-cruiser.cjs` — the same rules, mechanically enforced.'
+    echo
+    if [ "$MODE" = legacy ] && [ "$BOUNDARIES" = yes ]; then
       cat <<'LEGACY'
 ## This codebase predates the rules
 
@@ -537,6 +635,10 @@ day one.
   file for another reason, then run `bombi baseline` to re-record.
 - The baseline should only ever shrink. If a PR grows it, that's a review comment.
 
+LEGACY
+    fi
+    if [ "$MODE" = legacy ]; then
+      cat <<'LEGACY'
 ## Before you write anything
 
 Ask your agent to find the existing implementation first. On a codebase this age,
@@ -600,7 +702,7 @@ TAIL
     echo "\`specs/<NNN-feature-name>/spec.md\`  (or: n/a — small change)"; echo
     echo "## Checklist"
     echo "- [ ] \`bombi check\` passes"
-    [ "$MODE" = legacy ] && echo "- [ ] The known-violations baseline did not grow"
+    [ "$MODE" = legacy ] && [ "$BOUNDARIES" = yes ] && echo "- [ ] The known-violations baseline did not grow"
     [ "$MODE" = legacy ] && echo "- [ ] I searched for an existing implementation before adding a new one"
     echo "- [ ] Every acceptance criterion has a corresponding test"
     echo "- [ ] I have read every line of this diff and can defend it"
@@ -734,7 +836,8 @@ cmd_check() {
 # ═══════════════════════════════════════════════════════════════
 cmd_baseline() {
   need_repo
-  [ -f .dependency-cruiser.cjs ] || die "No .dependency-cruiser.cjs. Run 'bombi init' first."
+  [ "$(setting boundaries true)" = false ] && die "Boundaries are off for this repo — turn on with: bombi update --boundaries"
+  [ -f .dependency-cruiser.cjs ] || die "No .dependency-cruiser.cjs. Run 'bombi init' (or 'bombi update') first."
   survey
   local before=0 first=no
   if [ -f .dependency-cruiser-known-violations.json ]; then
@@ -830,7 +933,9 @@ cmd_doctor() {
   echo
 
   if [ -d .git ]; then
-    for f in AGENTS.md CLAUDE.md .dependency-cruiser.cjs scripts/verify.sh .specify/memory/constitution.md; do
+    local want="AGENTS.md CLAUDE.md scripts/verify.sh .specify/memory/constitution.md"
+    [ -f package.json ] && [ "$(setting boundaries true)" = false ] && dim "boundaries: off" || want="$want .dependency-cruiser.cjs"
+    for f in $want; do
       [ -e "$f" ] && ok "$f" || warn "$f missing — run 'bombi init'"
     done
     if [ -f .dependency-cruiser-known-violations.json ]; then
@@ -852,6 +957,86 @@ cmd_doctor() {
 }
 
 # ═══════════════════════════════════════════════════════════════
+# bombi update — refresh generated tooling after bombi itself improves
+# ═══════════════════════════════════════════════════════════════
+# Only the machine-owned files. AGENTS.md, CLAUDE.md and AI-QUICKSTART.md belong
+# to the team once written, so they are never touched here.
+cmd_update() {
+  for a in "$@"; do
+    case "$a" in
+      --dry-run)       DRY_RUN=yes ;;
+      --force)         FORCE=yes ;;
+      --boundaries)    BOUNDARIES=yes ;;
+      --no-boundaries) BOUNDARIES=no ;;
+      *) die "Unknown option for update: $a" ;;
+    esac
+  done
+  need_repo
+  [ -f package.json ] || die "No package.json here. bombi currently supports Node projects."
+  [ -f scripts/verify.sh ] || die "This repo hasn't been set up. Run 'bombi init' first."
+
+  printf "\n  bombi update%s\n  ────────────%s\n\n" \
+    "$([ $DRY_RUN = yes ] && echo " --dry-run")" "$([ $DRY_RUN = yes ] && echo "──────────")"
+  survey
+  ok "source: $SRC_DIR/   boundaries: $([ "$BOUNDARIES" = yes ] && echo on || echo off)"
+  echo
+
+  UPDATING=yes
+  gen_verify
+  chmod +x scripts/verify.sh 2>/dev/null || true
+  if [ "$BOUNDARIES" = yes ]; then
+    gen_depcruise
+    gen_hooks
+  else
+    remove_managed .dependency-cruiser.cjs
+    remove_managed .dependency-cruiser-known-violations.json
+    remove_managed .githooks/pre-commit
+  fi
+  gen_ci
+  UPDATING=no
+
+  if [ "$DRY_RUN" = yes ]; then echo; dim "nothing was written — rerun without --dry-run to apply"; echo; return; fi
+
+  set_setting boundaries "$([ "$BOUNDARIES" = yes ] && echo true || echo false)"
+  if [ "$BOUNDARIES" = yes ]; then
+    install_depcruise
+    gen_baseline
+  fi
+  echo
+  printf "${G}  Updated.${N} Review with 'git diff', then run: bombi check\n\n"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# bombi upgrade — replace this script with the latest release
+# ═══════════════════════════════════════════════════════════════
+cmd_upgrade() {
+  local src="${BOMBI_SRC:-https://raw.githubusercontent.com/Mahlomola-Moses/bombi/main/bombi}"
+  local self; self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  local tmp; tmp="$(mktemp)"
+  info "fetching $src"
+  if [ -f "$src" ]; then cp "$src" "$tmp"
+  elif ! curl -fsSL "$src" -o "$tmp"; then
+    rm -f "$tmp"
+    die "download failed — is the repo public? (a private repo's raw URL returns 404)"
+  fi
+  bash -n "$tmp" 2>/dev/null && grep -q '^BOMBI_VERSION=' "$tmp" || { rm -f "$tmp"; die "that isn't a bombi script — not installed"; }
+  local v; v="$(sed -n 's/^BOMBI_VERSION="\(.*\)"/\1/p' "$tmp")"
+  if cmp -s "$tmp" "$self"; then rm -f "$tmp"; ok "already up to date (bombi $v)"; return; fi
+  # never silently go backwards (e.g. local changes not yet pushed to the release)
+  if [ "$v" != "$BOMBI_VERSION" ] && [ "$(printf '%s\n%s\n' "$v" "$BOMBI_VERSION" | sort -V | tail -1)" = "$BOMBI_VERSION" ] \
+     && [ "${1:-}" != --force ]; then
+    rm -f "$tmp"
+    warn "the release is older (bombi $v) than this one (bombi $BOMBI_VERSION) — left alone"
+    dim "install it anyway:  bombi upgrade --force"
+    return
+  fi
+  [ -w "$self" ] || { rm -f "$tmp"; die "can't write $self"; }
+  cat "$tmp" > "$self"; rm -f "$tmp"
+  ok "bombi $BOMBI_VERSION → $v   ($self)"
+  dim "refresh a repo's generated files with:  bombi update"
+}
+
+# ═══════════════════════════════════════════════════════════════
 usage() {
   printf "\n  bombi %s — one AI dev setup, any assistant\n\n" "$BOMBI_VERSION"
   printf "  ${B}bombi init${N}              set up this repo          (tech lead, once)\n"
@@ -859,10 +1044,14 @@ usage() {
   printf "  ${B}bombi check${N}             run all gates             (you, CI, your agent)\n"
   printf "  ${B}bombi debt${N}              list baselined violations\n"
   printf "  ${B}bombi baseline${N}          re-record after fixing some (refuses to grow)\n"
+  printf "  ${B}bombi update${N}            refresh bombi's generated tooling in this repo\n"
+  printf "  ${B}bombi upgrade${N}           replace this bombi with the latest release\n"
   printf "  ${B}bombi context${N} [topic]   dump rules + code to paste into ChatGPT\n"
   printf "  ${B}bombi doctor${N} [--fix]     check the machine, and repair it with --fix\n\n"
   printf "  agent: claude | gemini | copilot | cursor | codex | none\n"
-  printf "  flags: -y / --yes   answer yes to every prompt (CI, scripts)\n\n"
+  printf "  flags: -y / --yes   answer yes to every prompt (CI, scripts)\n"
+  printf "  init:   --no-boundaries   skip architecture-boundary checks (old projects)\n"
+  printf "  update: --dry-run  --force  --boundaries | --no-boundaries\n\n"
 }
 
 # global flags
@@ -879,6 +1068,8 @@ case "${1:-}" in
   debt)     shift; cmd_debt "$@" ;;
   context)  shift; cmd_context "$@" ;;
   doctor)   shift; cmd_doctor "${1:-}" ;;
+  update)   shift; cmd_update "$@" ;;
+  upgrade)  shift; cmd_upgrade "$@" ;;
   -v|--version) echo "bombi $BOMBI_VERSION" ;;
   ""|-h|--help|help) usage ;;
   *) err "Unknown command: $1"; usage; exit 1 ;;
